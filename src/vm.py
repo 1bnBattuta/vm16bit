@@ -40,8 +40,8 @@ class VirtualMachine:
             with open(filename, 'rb') as f:  # Note 'rb' for binary mode
                 binary_data = f.read()
             
-            if len(binary_data) > (len(self.memory) - address):
-                raise MemoryError("Program exceeds available memory")
+            if address < 32768 or address + len(binary_data) - 1 > 32767:
+                raise ValueError("Attempt to load outside ROM area")
             
             for i, byte in enumerate(binary_data):
                 self.memory[address + i] = byte
