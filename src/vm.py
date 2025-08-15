@@ -34,34 +34,23 @@ class VirtualMachine:
         self.breakpoints = set()
         self.io_ports = [0] * 16  # 16 I/O ports (0xFF00-0xFF0F)
 
-    def load_program(self, filename):
-        """Load program from text file with hex bytes"""
+    def load_program(self, filename, address=0):
+        """Load raw binary program into memory"""
         try:
-            with open(filename, 'r') as f:
-                lines = f.readlines()
-                address = 0
-                for line in lines:
-                    # Skip empty lines and comments
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    
-                    # Convert hex string to integer
-                    byte = int(line, 16)
-                    if address < 0x8000:  # Only load into ROM area
-                        self.memory[address] = byte
-                        address += 1
-                    else:
-                        print(f"Warning: Program too large ({len(lines)} bytes)")
-                        break
+            with open(filename, 'rb') as f:  # Note 'rb' for binary mode
+                binary_data = f.read()
             
-            print(f"Loaded {address} bytes from {filename}")
+            if len(binary_data) > (len(self.memory) - address):
+                raise MemoryError("Program exceeds available memory")
+            
+            for i, byte in enumerate(binary_data):
+                self.memory[address + i] = byte
+                
+            print(f"Loaded {len(binary_data)} bytes from {filename}")
             return True
+            
         except FileNotFoundError:
             print(f"Error: File {filename} not found")
-            return False
-        except ValueError:
-            print(f"Error: Invalid hex value in {filename}")
             return False
 
     def fetch_byte(self):
