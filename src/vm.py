@@ -671,7 +671,30 @@ class VirtualMachine:
         """Add a breakpoint at specified address"""
         self.breakpoints.add(address)
 
-if __name__ == "__main__":
-    # Simple usage example
+# =================================================================
+# COMMAND-LINE INTERFACE
+# =================================================================
+def main():
+    """Entry point for command-line execution"""
+    parser = argparse.ArgumentParser(description='16-bit Virtual Machine')
+    parser.add_argument('program', nargs='?', help='Binary program file to load')
+    parser.add_argument('-d', '--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('-a', '--address', type=lambda x: int(x, 0), default=ROM_START,
+                        help=f'Start address (hex or decimal), default: {hex(ROM_START)}')
+    
+    args = parser.parse_args()
+    
     vm = VirtualMachine()
-    vm.run(debug=True)
+    
+    if args.program:
+        success = vm.run(program_file=args.program, 
+                         start_address=args.address,
+                         debug=args.debug)
+        sys.exit(0 if success else 1)
+    else:
+        print("No program file specified. Running in interactive mode.")
+        vm.run(debug=args.debug)
+
+
+if __name__ == "__main__":
+    main()
