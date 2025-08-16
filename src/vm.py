@@ -53,7 +53,7 @@ class VirtualMachine:
             0x01: self.mov_reg,      0x02: self.mov_mem_rd,
             0x03: self.mov_mem_wr,   0x04: self.mov_imm,
             0x05: self.ld,           0x06: self.st,
-            0x07: self.push,         0x08: self.pop,
+            0x07: self.inst_push,    0x08: self.inst_pop,
             0x09: self.lea,          0x10: self.add_reg,
             0x11: self.add_imm,      0x12: self.sub_reg,
             0x13: self.sub_imm,      0x14: self.mul,
@@ -173,7 +173,7 @@ class VirtualMachine:
         self.write_mem(address, value & 0xFF)
         self.write_mem(address + 1, (value >> 8) & 0xFF)
 
-    def push(self, value):
+    def stack_push(self, value):
         """Push 16-bit value onto stack with boundary check"""
         sp = self.reg['SP']
         
@@ -184,7 +184,7 @@ class VirtualMachine:
         self.write_mem_word(sp, value)
         self.reg['SP'] = sp - 2
 
-    def pop(self):
+    def stack_pop(self):
         """Pop 16-bit value from stack with boundary check"""
         sp = self.reg['SP'] + 2
         
@@ -225,7 +225,7 @@ class VirtualMachine:
     def update_flags_arith(self, result, width=16):
         """Update arithmetic flags after operation"""
         # Set Zero flag
-        self.set_flag(Z_FLAG, result == 0)
+        self.set_flag(Z_FLAG, (result & 0xFFFF) == 0)
         
         # Set Negative flag (sign bit)
         mask = 0x8000 if width == 16 else 0x80
@@ -233,14 +233,14 @@ class VirtualMachine:
         
         # Set Carry flag for unsigned overflow
         max_val = 0xFFFF if width == 16 else 0xFF
-        self.set_flag(C_FLAG, result > max_val)
+        self.set_flag(C_FLAG, result > max_val or result < 0)
         
         # Overflow flag must be set by individual operations
 
     def update_flags_logic(self, result, width=16):
         """Update flags for logical operations"""
         # Set Zero flag
-        self.set_flag(Z_FLAG, result == 0)
+        self.set_flag(Z_FLAG, (result & 0xFFFF) == 0)
         
         # Set Negative flag (sign bit)
         mask = 0x8000 if width == 16 else 0x80
@@ -294,20 +294,20 @@ class VirtualMachine:
         rs = REGISTERS[reg_byte & 0x0F]
         self.write_mem_word(self.reg[rd], self.reg[rs])
 
-    def push(self):
+    def inst_push(self):
         """PUSH Rs"""
         reg_byte = self.fetch_byte()
         rs = REGISTERS[reg_byte & 0x0F]
-        self.push(self.reg[rs])
+        self.stack_push(self.reg[rs])
 
-    def pop(self):
+    def inst_pop(self):
         """POP Rd"""
         reg_byte = self.fetch_byte()
         rd = REGISTERS[(reg_byte >> 4) & 0x0F]
-        self.reg[rd] = self.pop()
+        self.reg[rd] = self.stack_pop()
 
     def lea(self):
-        """LEA Rd, addr (Modern implementation)"""
+        """LEA Rd, addr"""
         reg_byte = self.fetch_byte()
         rd = REGISTERS[(reg_byte >> 4) & 0x0F]
         mode = reg_byte & 0x0F
@@ -410,6 +410,10 @@ class VirtualMachine:
         if divisor == 0:
             self.set_flag(Z_FLAG, True)
             self.reg[rd] = 0xFFFF  # Division by zero error value
+            # Clear other flags
+            self.set_flag(C_FLAG, False)
+            self.set_flag(O_FLAG, False)
+            self.set_flag(N_FLAG, False)
         else:
             self.set_flag(Z_FLAG, False)
             self.reg[rd] = dividend // divisor
@@ -555,29 +559,29 @@ class VirtualMachine:
     def call(self):
         """CALL addr"""
         addr = self.fetch_word()
-        self.push(self.reg['PC'])
+        self.stack_push(self.reg['PC'])
         self.reg['PC'] = addr
 
     def ret(self):
         """RET"""
-        self.reg['PC'] = self.pop()
+        self.reg['PC'] = self.stack_pop()
 
     def cmp(self):
         """CMP Rd, Rs"""
         reg_byte = self.fetch_byte()
         rd = REGISTERS[(reg_byte >> 4) & 0x0F]
         rs = REGISTERS[reg_byte & 0x0F]
-        result = self.reg[rd] - self.reg[rs]
-        
-        # Set flags as if subtraction occurred
-        self.set_flag(Z_FLAG, result == 0)
-        self.set_flag(N_FLAG, (result & 0x8000) != 0)
-        self.set_flag(C_FLAG, result < 0)  # Borrow occurred
-        
-        # Set overflow (same as SUB)
         a = self.reg[rd]
         b = self.reg[rs]
-        self.set_flag(O_FLAG, ((a ^ b) & 0x8000) != 0 and ((b ^ result) & 0x8000) == 0)
+        result = a - b
+        
+        # Set flags
+        self.set_flag(Z_FLAG, (result & 0xFFFF) == 0)
+        self.set_flag(N_FLAG, (result & 0x8000) != 0)
+        self.set_flag(C_FLAG, result < 0)  # Unsigned borrow
+        
+        # Set overflow (V) for signed overflow
+        self.set_flag(O_FLAG, ((a ^ b) & 0x8000) != 0 and ((a ^ result) & 0x8000) != 0)
 
     def test(self):
         """TEST Rd, Rs"""
@@ -649,7 +653,7 @@ class VirtualMachine:
                 print(f"Runtime error at PC={hex(start_pc)}: {e}")
                 self.running = False
 
-    def run(self, program_file, start_address=ROM_START, debug=False):
+    def run(self, program_file=None, start_address=ROM_START, debug=False):
         """Start the virtual machine"""
         self.debug = debug
         self.reg['PC'] = start_address
@@ -667,32 +671,7 @@ class VirtualMachine:
         """Add a breakpoint at specified address"""
         self.breakpoints.add(address)
 
-# =================================================================
-# MAIN EXECUTION
-# =================================================================
-def main():
-    # Configuration
-    BASE_DIR = Path(__file__).parent.resolve()
-    PROGRAMS_DIR = BASE_DIR / "programs"
-    TEST_FILE = "mov_test.bin"
-    DEBUG_MODE = True
-    BREAKPOINTS = [0x000A]
-    
-    # Construct program path
-    program_path = PROGRAMS_DIR / TEST_FILE
-    program_path = program_path.resolve()
-    
-    # Create and run VM
-    vm = VirtualMachine()
-    
-    # Add breakpoints
-    for addr in BREAKPOINTS:
-        vm.add_breakpoint(addr)
-        print(f"Added breakpoint at {hex(addr)}")
-    
-    # Run the program
-    vm.run(program_path, debug=DEBUG_MODE)
-
 if __name__ == "__main__":
-    main()
-
+    # Simple usage example
+    vm = VirtualMachine()
+    vm.run(debug=True)
