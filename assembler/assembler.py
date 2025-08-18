@@ -6,67 +6,62 @@ from collections import defaultdict
 # CONSTANTS AND SETUP
 # ================================================================
 REGISTERS = {'A', 'B', 'C', 'D', 'SP', 'PC', 'FP', 'FLAGS'}
+
+# Opcode map (aligned with the spec + appendix spirit)
 OPCODES = {
     # Data Movement
     'MOV': {
-        ('reg', 'reg'): 0x01,
-        ('reg', 'imm'): 0x04,
-        ('reg', 'mem_reg'): 0x05,  # LD
-        ('mem_reg', 'reg'): 0x06,  # ST
+        ('reg', 'reg'): 0x01,        # MOV Rd, Rs
+        ('reg', 'imm'): 0x04,        # MOV Rd, #imm16
+        ('reg', 'mem_reg'): 0x05,    # LD    Rd, [Rs]
+        ('mem_reg', 'reg'): 0x06,    # ST    [Rd], Rs
+        ('reg', 'abs'): 0x02,        # LD    Rd, [abs16]
+        ('abs', 'reg'): 0x03,        # ST    [abs16], Rs
     },
     'PUSH': {('reg',): 0x07},
-    'POP': {('reg',): 0x08},
+    'POP':  {('reg',): 0x08},
+
+    # LEA (single opcode, internal mode byte)
     'LEA': {
-        ('reg', 'abs'): 0x09,      # Mode 0
-        ('reg', 'label'): 0x09,    # Mode 1 (PC-relative)
-        ('reg', 'base_offset'): 0x09,  # Mode 2
+        ('reg', 'abs'): 0x09,        # Mode 0
+        ('reg', 'label'): 0x09,      # Mode 1 (PC-relative)
+        ('reg', 'base_offset'): 0x09 # Mode 2
     },
-    
+
     # Arithmetic
-    'ADD': {
-        ('reg', 'reg'): 0x10,
-        ('reg', 'imm'): 0x11,
-    },
-    'SUB': {
-        ('reg', 'reg'): 0x12,
-        ('reg', 'imm'): 0x13,
-    },
+    'ADD': {('reg', 'reg'): 0x10, ('reg', 'imm'): 0x11},
+    'SUB': {('reg', 'reg'): 0x12, ('reg', 'imm'): 0x13},
     'MUL': {('reg', 'reg'): 0x14},
     'DIV': {('reg', 'reg'): 0x15},
     'INC': {('reg',): 0x16},
     'DEC': {('reg',): 0x17},
     'NEG': {('reg',): 0x18},
-    
+
     # Logical
     'AND': {('reg', 'reg'): 0x20},
-    'OR': {('reg', 'reg'): 0x21},
+    'OR':  {('reg', 'reg'): 0x21},
     'XOR': {('reg', 'reg'): 0x22},
     'NOT': {('reg',): 0x23},
     'SHL': {('reg', 'imm'): 0x24},
     'SHR': {('reg', 'imm'): 0x25},
     'SAR': {('reg', 'imm'): 0x26},
-    
-    # Control Flow
+
+    # Control Flow (PC-relative 16-bit offset encoded by assembler)
     'JMP': {('label',): 0x30},
-    'JZ': {('label',): 0x31},
+    'JZ':  {('label',): 0x31},
     'JNZ': {('label',): 0x32},
-    'JC': {('label',): 0x33},
+    'JC':  {('label',): 0x33},
     'JNC': {('label',): 0x34},
-    'JO': {('label',): 0x35},
-    'JNO': {('label',): 0x36},
     'CALL': {('label',): 0x37},
     'RET': {(): 0x38},
-    'CMP': {
-        ('reg', 'reg'): 0x39,
-        ('reg', 'imm'): 0x39,  # Will be handled as reg, reg with temp reg
-    },
+    'CMP': {('reg', 'reg'): 0x39, ('reg', 'imm'): 0x39},
     'TEST': {('reg', 'reg'): 0x3A},
     'HLT': {(): 0xF0},
     'NOP': {(): 0xF1},
-    
+
     # I/O
     'OUT': {('imm',): 0xF2},
-    'IN': {('imm',): 0xF3},
+    'IN':  {('imm',): 0xF3},
 }
 
 # Addressing mode encodings for LEA
@@ -81,322 +76,372 @@ LEA_MODES = {
 # ================================================================
 class Assembler:
     def __init__(self):
-        self.symbol_table = {}
-        self.definitions = {}
+        self.symbol_table = {} # labels -> addresses
+        self.definitions = {}  # constants (.EQU)
         self.current_address = 0
         self.output = bytearray()
         self.pass_num = 0
+        # listing entries: (line_num, start_address, source_line, [bytes])
         self.listing = []
         self.warnings = []
         self.errors = []
-        self.temp_reg = 'D'  # Used for immediate comparisons
 
     def assemble(self, source, output_file=None):
         """Assemble source code into binary format"""
+        # Strip multi-line block comments globally
+        source = re.sub(r'/\*.*?\*/', '', source, flags=re.S)
         self.source_lines = source.splitlines()
         self._reset_assembler()
-        
-        # First pass: build symbol table and resolve constants
+
+        # First pass: build symbol table and measure sizes
         self.pass_num = 1
         self._first_pass()
-        
         if self.errors:
-            return False, self.errors, self.warnings
-        
+            return False, self.errors, self.warnings, b''
+
         # Second pass: generate machine code
         self.pass_num = 2
         self._reset_assembler()
         self._second_pass()
-        
+
         if output_file:
             with open(output_file, 'wb') as f:
                 f.write(self.output)
-        
+
         return True, self.errors, self.warnings, self.output
 
     def _reset_assembler(self):
         """Reset assembler state between passes"""
         self.current_address = 0
         self.output = bytearray()
+        self.listing = []
         if self.pass_num == 1:
             self.symbol_table = {}
             self.definitions = {}
+            self.warnings = []
+            self.errors = []
 
+    # ------------------ First Pass ------------------
     def _first_pass(self):
-        """First pass: build symbol table and resolve constants"""
         line_num = 0
-        for line in self.source_lines:
+        for raw_line in self.source_lines:
             line_num += 1
-            # Remove comments
-            clean_line = re.sub(r';.*$', '', line).strip()
-            clean_line = re.sub(r'/\*.*?\*/', '', clean_line).strip()
-            if not clean_line:
+            line = self._strip_line_comment(raw_line)
+            if not line:
                 continue
-            
-            # Process directives
-            if clean_line.startswith('.'):
-                self._process_directive(clean_line, line_num)
+
+            # Directives
+            if line.startswith('.'):
+                self._process_directive(line, line_num)
                 continue
-                
-            # Process label definition
-            if ':' in clean_line:
-                label, _, rest = clean_line.partition(':')
+
+            # Label (optional)
+            if ':' in line:
+                label, _, rest = line.partition(':')
                 label = label.strip()
                 if not self._is_valid_identifier(label):
                     self.errors.append(f"Line {line_num}: Invalid label name '{label}'")
                     continue
-                    
                 if label in self.symbol_table:
                     self.errors.append(f"Line {line_num}: Duplicate label '{label}'")
                     continue
-                    
                 self.symbol_table[label] = self.current_address
-                clean_line = rest.strip()
-                if not clean_line:
+                line = rest.strip()
+                if not line:
                     continue
-            
-            # Process instruction (just to advance address)
-            parts = clean_line.split(maxsplit=1)
+
+            # Instruction sizing
+            parts = line.split(maxsplit=1)
             if not parts:
                 continue
-                
             mnemonic = parts[0].upper()
-            operands = parts[1].split(',') if len(parts) > 1 else []
-            operands = [op.strip() for op in operands]
-            
-            # Calculate instruction size
+            operands = self._split_operands(parts[1]) if len(parts) > 1 else []
             try:
                 size = self._get_instruction_size(mnemonic, operands)
                 self.current_address += size
             except ValueError as e:
                 self.errors.append(f"Line {line_num}: {str(e)}")
 
+    # ------------------ Second Pass ------------------
     def _second_pass(self):
-        """Second pass: generate machine code"""
         line_num = 0
-        for line in self.source_lines:
+        for raw_line in self.source_lines:
             line_num += 1
-            # Preserve original line for listing
-            orig_line = line.rstrip()
-            
-            # Remove comments
-            clean_line = re.sub(r';.*$', '', line).strip()
-            clean_line = re.sub(r'/\*.*?\*/', '', clean_line).strip()
-            if not clean_line:
-                self.listing.append((line_num, orig_line, []))
+            orig_line = raw_line.rstrip()
+
+            clean = self._strip_line_comment(raw_line)
+            if not clean:
+                self.listing.append((line_num, self.current_address, orig_line, []))
                 continue
-            
-            # Process directives
-            if clean_line.startswith('.'):
-                self._process_directive(clean_line, line_num, orig_line)
+
+            # Directives
+            if clean.startswith('.'):
+                start_address = self.current_address
+                self._process_directive(clean, line_num, orig_line)
+                self.listing.append((line_num, start_address, orig_line, []))
                 continue
-                
-            # Process label definition
-            label_part = ""
-            if ':' in clean_line:
-                label, _, rest = clean_line.partition(':')
-                label = label.strip()
-                clean_line = rest.strip()
-                label_part = label + ":"
-                
-                if not clean_line:
-                    self.listing.append((line_num, orig_line, []))
+
+            # Label
+            if ':' in clean:
+                _, _, rest = clean.partition(':')
+                clean = rest.strip()
+                if not clean:
+                    self.listing.append((line_num, self.current_address, orig_line, []))
                     continue
-            
-            # Process instruction
-            parts = clean_line.split(maxsplit=1)
+
+            # Instruction encode
+            parts = clean.split(maxsplit=1)
             if not parts:
-                self.listing.append((line_num, orig_line, []))
+                self.listing.append((line_num, self.current_address, orig_line, []))
                 continue
-                
+
             mnemonic = parts[0].upper()
-            operands = parts[1].split(',') if len(parts) > 1 else []
-            operands = [op.strip() for op in operands]
-            
+            operands = self._split_operands(parts[1]) if len(parts) > 1 else []
             start_address = self.current_address
             try:
                 self._encode_instruction(mnemonic, operands, line_num)
             except (ValueError, KeyError) as e:
                 self.errors.append(f"Line {line_num}: {str(e)}")
-            
-            # Capture generated bytes for listing
-            generated_bytes = self.output[start_address:self.current_address]
-            self.listing.append((line_num, orig_line, list(generated_bytes)))
 
+            generated = self.output[start_address:self.current_address]
+            self.listing.append((line_num, start_address, orig_line, list(generated)))
+
+    # ------------------ Directive Handling ------------------
     def _process_directive(self, line, line_num, orig_line=None):
-        """Process assembler directives"""
-        parts = line.split()
+        parts = line.split(maxsplit=1)
         directive = parts[0].upper()
-        
-        # .ORG address
+        argstr = parts[1] if len(parts) > 1 else ""
+
         if directive == '.ORG':
-            if len(parts) < 2:
+            if not argstr:
                 self.errors.append(f"Line {line_num}: .ORG requires an address")
                 return
-                
             try:
-                address = self._parse_value(parts[1])
+                address = self._parse_value(argstr.strip())
+                if address < 0 or address > 0xFFFF:
+                    raise ValueError
                 self.current_address = address
             except ValueError:
                 self.errors.append(f"Line {line_num}: Invalid address for .ORG")
-        
-        # .DB byte1, byte2, ...
+
         elif directive == '.DB':
-            if len(parts) < 2:
+            # .DB byte1, byte2, ...   can include 'A' or "Hello world"
+            items = self._split_args(argstr)
+            if not items:
                 self.errors.append(f"Line {line_num}: .DB requires at least one value")
                 return
-                
-            for val_str in parts[1:]:
-                try:
-                    # Handle strings
-                    if val_str.startswith("'") and val_str.endswith("'"):
-                        if len(val_str) == 3:  # Single character
-                            value = ord(val_str[1])
-                        else:
-                            self.errors.append(f"Line {line_num}: Invalid character literal")
-                            continue
-                    elif val_str.startswith('"') and val_str.endswith('"'):
-                        # String value
-                        s = val_str[1:-1]
-                        if self.pass_num == 2:
-                            for char in s:
-                                self.output.append(ord(char))
-                                self.current_address += 1
-                        else:
-                            self.current_address += len(s)
-                        continue
-                    else:
-                        value = self._parse_value(val_str)
-                        
+            for item in items:
+                item = item.strip()
+                if self._is_double_quoted(item):
+                    s = self._unquote_double(item)
                     if self.pass_num == 2:
-                        self.output.append(value & 0xFF)
+                        for ch in s:
+                            self.output.append(ord(ch) & 0xFF)
+                    self.current_address += len(s)
+                elif self._is_single_quoted_char(item):
+                    if self.pass_num == 2:
+                        self.output.append(ord(item[1]) & 0xFF)
                     self.current_address += 1
-                except ValueError:
-                    self.errors.append(f"Line {line_num}: Invalid value for .DB")
-        
-        # .DW word1, word2, ...
+                else:
+                    try:
+                        v = self._parse_value(item)
+                        self._require_u16(v, line_num, "byte", maxv=0xFF)
+                        if self.pass_num == 2:
+                            self.output.append(v & 0xFF)
+                        self.current_address += 1
+                    except ValueError:
+                        self.errors.append(f"Line {line_num}: Invalid value for .DB -> {item}")
+
         elif directive == '.DW':
-            if len(parts) < 2:
+            items = self._split_args(argstr)
+            if not items:
                 self.errors.append(f"Line {line_num}: .DW requires at least one value")
                 return
-                
-            for val_str in parts[1:]:
+            for item in items:
+                item = item.strip()
                 try:
-                    value = self._parse_value(val_str)
+                    v = self._parse_value(item)
+                    self._require_u16(v, line_num, "word", maxv=0xFFFF)
                     if self.pass_num == 2:
-                        # Little-endian
-                        self.output.append(value & 0xFF)
-                        self.output.append((value >> 8) & 0xFF)
+                        # little-endian
+                        self.output.append(v & 0xFF)
+                        self.output.append((v >> 8) & 0xFF)
                     self.current_address += 2
                 except ValueError:
-                    self.errors.append(f"Line {line_num}: Invalid value for .DW")
-        
-        # .DS count
+                    self.errors.append(f"Line {line_num}: Invalid value for .DW -> {item}")
+
         elif directive == '.DS':
-            if len(parts) < 2:
+            if not argstr:
                 self.errors.append(f"Line {line_num}: .DS requires a size")
                 return
-                
             try:
-                size = self._parse_value(parts[1])
+                size = self._parse_value(argstr.strip())
+                if size < 0:
+                    raise ValueError
                 if self.pass_num == 2:
                     self.output.extend(b'\x00' * size)
                 self.current_address += size
             except ValueError:
                 self.errors.append(f"Line {line_num}: Invalid size for .DS")
-        
-        # .EQU NAME = value
+
         elif directive == '.EQU':
-            if len(parts) < 4 or parts[2] != '=':
+            # Syntax: .EQU NAME = value
+            m = re.match(r'\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$', argstr)
+            if not m:
                 self.errors.append(f"Line {line_num}: Invalid .EQU syntax")
                 return
-                
-            name = parts[1]
+            name, val_expr = m.group(1), m.group(2).strip()
             if not self._is_valid_identifier(name):
                 self.errors.append(f"Line {line_num}: Invalid constant name '{name}'")
                 return
-                
             try:
-                value = self._parse_value(parts[3])
+                value = self._parse_value(val_expr)
                 if name in self.definitions:
                     self.errors.append(f"Line {line_num}: Duplicate constant '{name}'")
                 else:
                     self.definitions[name] = value
             except ValueError:
                 self.errors.append(f"Line {line_num}: Invalid value for .EQU")
-        
-        # Add to listing if in second pass
-        if self.pass_num == 2 and orig_line:
-            self.listing.append((line_num, orig_line, []))
+
+    # ------------------ Parsing Helpers ------------------
+    def _strip_line_comment(self, line):
+        # strip ; comments, trim, collapse internal block comments (already stripped globally)
+        line = re.sub(r';.*$', '', line)
+        return line.strip()
+
+    def _split_args(self, argstr):
+        """Split a directive arg string by commas, preserving quoted strings."""
+        items = []
+        buf = []
+        in_single = False
+        in_double = False
+        i = 0
+        while i < len(argstr):
+            c = argstr[i]
+            if c == "'" and not in_double:
+                in_single = not in_single
+                buf.append(c)
+            elif c == '"' and not in_single:
+                in_double = not in_double
+                buf.append(c)
+            elif c == ',' and not in_single and not in_double:
+                items.append(''.join(buf).strip())
+                buf = []
+            else:
+                buf.append(c)
+            i += 1
+        if buf:
+            items.append(''.join(buf).strip())
+        # remove empty entries (e.g., trailing commas)
+        return [x for x in items if x != '']
+
+    def _split_operands(self, opstr):
+        """Split instruction operands by commas, respecting brackets and quotes."""
+        items = []
+        buf = []
+        depth = 0  # bracket depth for [...]
+        in_single = False
+        in_double = False
+        i = 0
+        while i < len(opstr):
+            c = opstr[i]
+            if c == "'" and not in_double:
+                in_single = not in_single
+                buf.append(c)
+            elif c == '"' and not in_single:
+                in_double = not in_double
+                buf.append(c)
+            elif c == '[' and not in_single and not in_double:
+                depth += 1
+                buf.append(c)
+            elif c == ']' and not in_single and not in_double:
+                depth = max(0, depth - 1)
+                buf.append(c)
+            elif c == ',' and depth == 0 and not in_single and not in_double:
+                items.append(''.join(buf).strip())
+                buf = []
+            else:
+                buf.append(c)
+            i += 1
+        if buf:
+            items.append(''.join(buf).strip())
+        return items
+
+    def _is_double_quoted(self, s):
+        return len(s) >= 2 and s[0] == '"' and s[-1] == '"'
+
+    def _unquote_double(self, s):
+        return s[1:-1]
+
+    def _is_single_quoted_char(self, s):
+        return len(s) == 3 and s[0] == "'" and s[2] == "'"
 
     def _parse_value(self, value_str):
-        """Parse numeric value with support for different bases and symbols"""
-        # Handle character literals
-        if value_str.startswith("'") and value_str.endswith("'") and len(value_str) == 3:
+        """Parse numeric value with different bases, constants, and labels."""
+        value_str = value_str.strip()
+
+        # char literal
+        if self._is_single_quoted_char(value_str):
             return ord(value_str[1])
-            
-        # Handle defined constants
+
+        # constants
         if value_str in self.definitions:
             return self.definitions[value_str]
-            
-        # Handle labels (in second pass)
+
+        # labels (only resolved in pass 2)
         if self.pass_num == 2 and value_str in self.symbol_table:
             return self.symbol_table[value_str]
-            
-        # Handle hexadecimal
+
+        # Allow optional leading '#'
+        if value_str.startswith('#'):
+            value_str = value_str[1:].strip()
+
+        # uppercase hex 0X
+        if value_str.startswith('0X'):
+            value_str = '0x' + value_str[2:]
+
+        # hex
         if value_str.startswith('0x'):
             return int(value_str[2:], 16)
-            
-        # Handle binary
+
+        # binary
         if value_str.startswith('0b'):
             return int(value_str[2:], 2)
-            
-        # Handle decimal
-        if value_str.isdigit() or (value_str[0] == '-' and value_str[1:].isdigit()):
-            return int(value_str)
-            
-        # Handle symbolic expressions
+
+        # decimal (signed allowed)
+        if re.fullmatch(r'-?\d+', value_str):
+            return int(value_str, 10)
+
+        # simple + / - expressions (left-to-right)
         if '+' in value_str:
-            parts = value_str.split('+')
-            return sum(self._parse_value(p.strip()) for p in parts)
-            
+            parts = [p.strip() for p in value_str.split('+')]
+            return sum(self._parse_value(p) for p in parts)
         if '-' in value_str:
-            parts = value_str.split('-')
-            result = self._parse_value(parts[0].strip())
+            parts = [p.strip() for p in value_str.split('-')]
+            base = self._parse_value(parts[0])
             for p in parts[1:]:
-                result -= self._parse_value(p.strip())
-            return result
-            
-        # Handle PC-relative expressions
-        if value_str.startswith('$'):
-            # PC-relative calculation will be done during encoding
-            return value_str
-            
+                base -= self._parse_value(p)
+            return base
+
+        # if still unresolved and looks like identifier: leave for pass 2
+        if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', value_str):
+            if self.pass_num == 2:
+                raise ValueError(f"Unknown symbol '{value_str}'")
+            # in pass 1 we don't need numeric value; caller should not force-evaluate it
+            return 0
+
         raise ValueError(f"Invalid value: '{value_str}'")
 
     def _get_operand_type(self, operand):
-        """Determine operand type and its value"""
-        # Register operand
-        if operand in REGISTERS:
-            return 'reg', operand
-            
-        # Immediate value
-        if operand.startswith('#'):
-            value = operand[1:]
-            return 'imm', value
-            
-        # Label (for jumps and addresses)
-        if operand in self.symbol_table or operand in self.definitions:
-            return 'label', operand
-            
-        # Memory operand: [expression]
-        if operand.startswith('[') and operand.endswith(']'):
-            expr = operand[1:-1].strip()
-            
+        """Classify operand type."""
+        op = operand.strip()
+
+        # Memory operand: [ ... ]
+        if op.startswith('[') and op.endswith(']'):
+            expr = op[1:-1].strip()
             # Register indirect
             if expr in REGISTERS:
                 return 'mem_reg', expr
-                
             # Base + offset
             if '+' in expr:
                 base, offset = expr.split('+', 1)
@@ -404,252 +449,266 @@ class Assembler:
                 offset = offset.strip()
                 if base in REGISTERS:
                     return 'base_offset', (base, offset)
-                
-            # Absolute address or label
+            # Absolute address or label expression
             return 'abs', expr
-            
-        # PC-relative expression
-        if operand.startswith('$'):
-            return 'label', operand[1:]
-            
-        # Numeric value
+
+        # Register
+        if op in REGISTERS:
+            return 'reg', op
+
+        # Immediate
+        if op.startswith('#'):
+            return 'imm', op[1:].strip()
+
+        # Label or identifier-like (treat as label in pass 1 for sizing)
+        if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', op):
+            return 'label', op
+
+        # Numeric literal without '#'
         try:
-            value = self._parse_value(operand)
-            return 'imm', value
+            _ = self._parse_value(op)  # may return 0 in pass 1 for unresolved labels
+            return 'imm', op
         except ValueError:
-            pass
-            
-        return 'unknown', operand
+            return 'unknown', op
 
     def _get_instruction_size(self, mnemonic, operands):
-        """Determine instruction size for address calculation"""
-        # Handle directives separately
+        """Compute size in bytes."""
         if mnemonic.startswith('.'):
             return 0
-            
-        # Get operand types
+
+        # classify
         op_types = []
-        op_values = []
         for op in operands:
-            op_type, op_value = self._get_operand_type(op)
-            op_types.append(op_type)
-            op_values.append(op_value)
-            
-        # Special handling for MOV
+            t, _ = self._get_operand_type(op)
+            op_types.append(t)
+
+        # MOV variants
         if mnemonic == 'MOV':
-            if op_types[0] == 'reg' and op_types[1] == 'mem_reg':
-                return 2  # LD
-            elif op_types[0] == 'mem_reg' and op_types[1] == 'reg':
-                return 2  # ST
-            elif op_types[1] == 'imm':
-                return 4
-            else:
+            if op_types == ['reg', 'mem_reg'] or op_types == ['mem_reg', 'reg']:
                 return 2
-                
-        # Handle LEA addressing modes
+            if op_types == ['reg', 'abs'] or op_types == ['abs', 'reg']:
+                return 4
+            if op_types == ['reg', 'imm']:
+                return 4
+            return 2  # reg,reg
+
+        # LEA
         if mnemonic == 'LEA':
-            if op_types[1] == 'abs':
-                return 4
-            elif op_types[1] == 'label':
-                return 4
-            elif op_types[1] == 'base_offset':
-                return 5
-                
-        # Handle jumps and calls
-        if mnemonic in ['JMP', 'JZ', 'JNZ', 'JC', 'JNC', 'JO', 'JNO', 'CALL']:
+            if len(op_types) != 2 or op_types[0] != 'reg':
+                raise ValueError("LEA requires Rd, address")
+            if op_types[1] in ('abs', 'label'):
+                return 4  # opcode + mode + 16-bit
+            if op_types[1] == 'base_offset':
+                return 5  # opcode + mode + base + 16-bit
+            raise ValueError("Invalid LEA addressing mode")
+
+        # jumps/call: opcode + 16-bit PC-relative offset
+        if mnemonic in ['JMP', 'JZ', 'JNZ', 'JC', 'JNC', 'CALL']:
             return 3
-            
-        # Handle I/O instructions
+
+        # I/O
         if mnemonic in ['OUT', 'IN']:
             return 2
-            
-        # Handle immediate arithmetic
-        if mnemonic in ['ADD', 'SUB'] and op_types[1] == 'imm':
+
+        # Immediate arithmetic
+        if mnemonic in ['ADD', 'SUB'] and len(op_types) == 2 and op_types[1] == 'imm':
             return 4
-            
-        # Handle shifts
+
+        # Shifts
         if mnemonic in ['SHL', 'SHR', 'SAR']:
             return 3
-            
-        # Handle CMP immediate (needs temporary register)
-        if mnemonic == 'CMP' and op_types[1] == 'imm':
-            return 6  # MOV + CMP + MOV (to restore temp reg)
-            
-        # Default sizes
-        if len(operands) == 0:
+
+        # CMP reg, imm
+        if mnemonic == 'CMP' and len(op_types) == 2 and op_types[1] == 'imm':
+            return 4
+
+        # Defaults
+        if mnemonic in ['RET', 'HLT', 'NOP']:
             return 1
-        elif len(operands) == 1:
+        if len(operands) == 1:
             return 2
-        else:
-            return 2
+        return 2
 
+    # ------------------ Encoding ------------------
     def _encode_instruction(self, mnemonic, operands, line_num):
-        """Encode instruction to binary output"""
-        # Get operand types and values
-        op_types = []
-        op_values = []
+        # classify with values
+        op_types, op_values = [], []
         for op in operands:
-            op_type, op_value = self._get_operand_type(op)
-            op_types.append(op_type)
-            op_values.append(op_value)
-            
-        # Special handling for MOV with memory operands
-        if mnemonic == 'MOV':
-            if op_types[0] == 'reg' and op_types[1] == 'mem_reg':
-                self._encode_ld(op_values[0], op_values[1])
-                return
-            elif op_types[0] == 'mem_reg' and op_types[1] == 'reg':
-                self._encode_st(op_values[0], op_values[1])
-                return
-                
-        # Handle CMP immediate using temp register
-        if mnemonic == 'CMP' and op_types[1] == 'imm':
-            # Save temp register
-            self._encode_push([self.temp_reg])
-            # Load immediate to temp register
-            self._encode_mov(self.temp_reg, f"#{op_values[1]}")
-            # Compare
-            self._encode_cmp(op_values[0], self.temp_reg)
-            # Restore temp register
-            self._encode_pop([self.temp_reg])
-            return
-            
-        # Get opcode
+            t, v = self._get_operand_type(op)
+            op_types.append(t)
+            op_values.append(v)
+
+        # fetch opcode
         try:
-            opcode_info = OPCODES[mnemonic][tuple(op_types)]
-            self.output.append(opcode_info)
-            self.current_address += 1
+            opcode = OPCODES[mnemonic][tuple(op_types)]
         except KeyError:
-            raise ValueError(f"Invalid operand combination for {mnemonic}")
-            
-        # Encode operands based on instruction type
-        if mnemonic == 'MOV':
-            self._encode_mov_operands(op_values[0], op_values[1])
-        elif mnemonic == 'LEA':
-            self._encode_lea_operands(op_values[0], op_types[1], op_values[1])
-        elif mnemonic in ['ADD', 'SUB', 'AND', 'OR', 'XOR', 'CMP', 'TEST']:
-            self._encode_reg_reg(op_values[0], op_values[1])
-        elif mnemonic in ['SHL', 'SHR', 'SAR']:
-            self._encode_shift(op_values[0], op_values[1])
-        elif mnemonic in ['PUSH', 'POP', 'INC', 'DEC', 'NEG', 'NOT']:
-            self._encode_single_reg(op_values[0])
-        elif mnemonic in ['JMP', 'JZ', 'JNZ', 'JC', 'JNC', 'JO', 'JNO', 'CALL']:
-            self._encode_jump(op_values[0])
-        elif mnemonic in ['OUT', 'IN']:
-            self._encode_io(op_values[0])
-        elif mnemonic in ['RET', 'HLT', 'NOP']:
-            pass  # No operands
+            raise ValueError(f"Invalid operand combination for {mnemonic}: {op_types}")
 
-    def _encode_mov_operands(self, rd, rs):
-        """Encode MOV operands"""
-        # Register to register
-        self.output.append((self._reg_index(rd) << 4) | self._reg_index(rs))
+        # write opcode byte
+        self.output.append(opcode)
         self.current_address += 1
-        
-        # Immediate value
-        if isinstance(rs, str) and rs.startswith('#'):
-            value = self._parse_value(rs[1:])
-            self.output.append(value & 0xFF)
-            self.output.append((value >> 8) & 0xFF)
-            self.current_address += 2
 
-    def _encode_ld(self, rd, rs):
-        """Encode LD (load from memory)"""
-        self.output.append(0x05)  # LD opcode
-        self.output.append((self._reg_index(rd) << 4) | self._reg_index(rs))
-        self.current_address += 2
+        if mnemonic == 'MOV':
+            self._encode_MOV(op_types, op_values, line_num)
+            return
 
-    def _encode_st(self, rd, rs):
-        """Encode ST (store to memory)"""
-        self.output.append(0x06)  # ST opcode
-        self.output.append((self._reg_index(rd) << 4) | self._reg_index(rs))
-        self.current_address += 2
+        if mnemonic == 'LEA':
+            self._encode_LEA(op_types, op_values, line_num)
+            return
 
-    def _encode_lea_operands(self, rd, mode, value):
-        """Encode LEA operands"""
-        # Mode encoding: rd in high nibble, mode in low nibble
+        if mnemonic in ['ADD', 'SUB']:
+            if op_types == ['reg', 'reg']:
+                self._encode_reg_reg(op_values[0], op_values[1])
+                return
+            if op_types == ['reg', 'imm']:
+                self._encode_reg_imm(op_values[0], op_values[1], line_num)
+                return
+
+        if mnemonic in ['AND', 'OR', 'XOR', 'CMP', 'TEST', 'MUL', 'DIV']:
+            if op_types == ['reg', 'reg']:
+                self._encode_reg_reg(op_values[0], op_values[1])
+                return
+            if mnemonic == 'CMP' and op_types == ['reg', 'imm']:
+                self._encode_reg_imm(op_values[0], op_values[1], line_num)
+                return
+
+        if mnemonic in ['SHL', 'SHR', 'SAR']:
+            self._encode_shift(op_values[0], op_values[1], line_num)
+            return
+
+        if mnemonic in ['PUSH', 'POP', 'INC', 'DEC', 'NEG', 'NOT']:
+            self._encode_single_reg(op_values[0])
+            return
+
+        if mnemonic in ['JMP', 'JZ', 'JNZ', 'JC', 'JNC', 'CALL']:
+            self._encode_jump_pc_relative(op_values[0])
+            return
+
+        if mnemonic in ['RET', 'HLT', 'NOP']:
+            return
+
+        if mnemonic in ['OUT', 'IN']:
+            self._encode_io(op_values[0], line_num)
+            return
+
+        raise ValueError(f"Unhandled encoding for {mnemonic} {op_types}")
+
+    # MOV encoding variants
+    def _encode_MOV(self, op_types, op_values, line_num):
+        if op_types == ['reg', 'reg']:
+            self._encode_reg_reg(op_values[0], op_values[1])
+        elif op_types == ['reg', 'imm']:
+            self._encode_reg_imm(op_values[0], op_values[1], line_num)
+        elif op_types == ['reg', 'mem_reg']:
+            # LD Rd, [Rs]
+            self._encode_reg_reg(op_values[0], op_values[1])
+        elif op_types == ['mem_reg', 'reg']:
+            # ST [Rd], Rs   (first value is address register)
+            self._encode_reg_reg(op_values[0], op_values[1])
+        elif op_types == ['reg', 'abs']:
+            # LD Rd, [abs16] : reg byte + 16-bit address
+            self._encode_reg_abs(op_values[0], op_values[1], line_num)
+        elif op_types == ['abs', 'reg']:
+            # ST [abs16], Rs : reg byte + 16-bit address
+            self._encode_reg_abs(op_values[1], op_values[0], line_num)  # reuse helper (rd, abs)
+        else:
+            raise ValueError(f"MOV: invalid combination {op_types}")
+
+    def _encode_LEA(self, op_types, op_values, line_num):
+        rd = op_values[0]
+        mode = op_types[1]
         mode_byte = (self._reg_index(rd) << 4) | LEA_MODES[mode]
         self.output.append(mode_byte)
         self.current_address += 1
-        
+
         if mode == 'abs':
-            # Absolute address
-            addr = self._parse_value(value)
-            self.output.append(addr & 0xFF)
-            self.output.append((addr >> 8) & 0xFF)
-            self.current_address += 2
+            addr = self._parse_value(op_values[1])
+            self._require_u16(addr, line_num, "address", 0xFFFF)
+            self._emit_u16(addr)
         elif mode == 'label':
-            # PC-relative address
-            label_addr = self._parse_value(value)
-            offset = label_addr - (self.current_address + 2)
-            if offset < 0:
-                offset = (1 << 16) + offset  # Two's complement
-            self.output.append(offset & 0xFF)
-            self.output.append((offset >> 8) & 0xFF)
-            self.current_address += 2
+            label_addr = self._parse_value(op_values[1])
+            # offset relative to end of the 2-byte immediate (current + 2)
+            offset = (label_addr - (self.current_address + 2)) & 0xFFFF
+            self._emit_u16(offset)
         elif mode == 'base_offset':
-            # Base + offset
-            base_reg, offset = value
-            self.output.append(self._reg_index(base_reg))
+            base_reg, offset = op_values[1]
+            self.output.append(self._reg_index(base_reg) & 0x0F)
             self.current_address += 1
-            offset_val = self._parse_value(offset)
-            self.output.append(offset_val & 0xFF)
-            self.output.append((offset_val >> 8) & 0xFF)
-            self.current_address += 2
+            if isinstance(offset, str) and offset.startswith('#'):
+                offset = offset[1:].strip()
+            off_val = self._parse_value(offset)
+            self._require_u16(off_val, line_num, "offset", 0xFFFF)
+            self._emit_u16(off_val)
+        else:
+            raise ValueError("Invalid LEA mode")
 
     def _encode_reg_reg(self, rd, rs):
-        """Encode two register operands"""
         self.output.append((self._reg_index(rd) << 4) | self._reg_index(rs))
         self.current_address += 1
 
-    def _encode_shift(self, rd, count):
-        """Encode shift instruction"""
-        self.output.append((self._reg_index(rd) << 4))
+    def _encode_reg_imm(self, rd, imm_str_or_val, line_num):
+        val = self._parse_value(imm_str_or_val)
+        self._require_u16(val, line_num, "immediate", 0xFFFF)
+        self.output.append(self._reg_index(rd) << 4)
         self.current_address += 1
-        count_val = self._parse_value(count)
-        self.output.append(count_val & 0x0F)  # Only 4 bits
+        self._emit_u16(val)
+
+    def _encode_reg_abs(self, rd, abs_expr, line_num):
+        addr = self._parse_value(abs_expr)
+        self._require_u16(addr, line_num, "address", 0xFFFF)
+        self.output.append(self._reg_index(rd) << 4)
+        self.current_address += 1
+        self._emit_u16(addr)
+
+    def _encode_shift(self, rd, count_expr, line_num):
+        count = self._parse_value(count_expr)
+        if count < 0 or count > 15:
+            raise ValueError(f"Shift count out of range (0..15): {count}")
+        self.output.append(self._reg_index(rd) << 4)
+        self.current_address += 1
+        self.output.append(count & 0x0F)
         self.current_address += 1
 
     def _encode_single_reg(self, reg):
-        """Encode single register operand"""
-        self.output.append((self._reg_index(reg) << 4))
+        self.output.append(self._reg_index(reg) << 4)
         self.current_address += 1
 
-    def _encode_jump(self, target):
-        """Encode jump instruction"""
-        target_addr = self._parse_value(target)
-        self.output.append(target_addr & 0xFF)
-        self.output.append((target_addr >> 8) & 0xFF)
+    def _encode_jump_pc_relative(self, target_label_or_value):
+        target_addr = self._parse_value(target_label_or_value)
+        # PC-relative offset from end of the 2-byte immediate (current + 2)
+        offset = (target_addr - (self.current_address + 2)) & 0xFFFF
+        self._emit_u16(offset)
+
+    def _encode_io(self, port_expr, line_num):
+        port = self._parse_value(port_expr)
+        if port < 0 or port > 15:
+            raise ValueError(f"I/O port out of range (0..15): {port}")
+        self.output.append(port & 0x0F)
+        self.current_address += 1
+
+    # ------------------ Utilities ------------------
+    def _emit_u16(self, val):
+        self.output.append(val & 0xFF)
+        self.output.append((val >> 8) & 0xFF)
         self.current_address += 2
 
-    def _encode_io(self, port):
-        """Encode I/O instruction"""
-        port_val = self._parse_value(port)
-        self.output.append(port_val & 0x0F)  # Only 4 bits
-        self.current_address += 1
-
-    def _encode_push(self, registers):
-        for reg in registers:
-            self.output.append(0x07)  # PUSH opcode
-            self.output.append(self._reg_index(reg))
-            self.current_address += 2
-
-    def _encode_pop(self, registers):
-        for reg in registers:
-            self.output.append(0x08)  # POP opcode
-            self.output.append(self._reg_index(reg) << 4)
-            self.current_address += 2
+    def _require_u16(self, val, line_num, kind="value", maxv=0xFFFF):
+        if not (-(1 << 31) <= val <= (1 << 31) - 1):
+            raise ValueError(f"Line {line_num}: {kind} too large: {val}")
+        if val < 0 or val > maxv:
+            raise ValueError(f"Line {line_num}: {kind} out of range: {val}")
 
     def _reg_index(self, reg_name):
-        """Get numeric index for register"""
         reg_map = {
             'A': 0, 'B': 1, 'C': 2, 'D': 3,
             'SP': 4, 'PC': 5, 'FP': 6, 'FLAGS': 7
         }
-        return reg_map[reg_name.upper()]
+        name = reg_name.upper()
+        if name not in reg_map:
+            raise ValueError(f"Unknown register '{reg_name}'")
+        return reg_map[name]
 
     def _is_valid_identifier(self, name):
-        """Check if a label or constant name is valid"""
         return re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name) is not None
 
 
@@ -664,37 +723,35 @@ def main():
     input_file = sys.argv[1]
     output_file = sys.argv[2] if len(sys.argv) > 2 else input_file.replace('.asm', '.bin')
 
-    # Read source file
-    with open(input_file, 'r') as f:
+    with open(input_file, 'r', encoding='utf-8') as f:
         source = f.read()
 
-    # Assemble
     assembler = Assembler()
     success, errors, warnings, binary = assembler.assemble(source, output_file)
 
-    # Print results
     if warnings:
         print("\nWarnings:")
-        for warning in warnings:
-            print(f"  {warning}")
-            
+        for w in warnings:
+            print(f"  {w}")
+
     if errors:
         print("\nErrors:")
-        for error in errors:
-            print(f"  {error}")
+        for e in errors:
+            print(f"  {e}")
         print("\nAssembly failed")
         sys.exit(1)
-        
+
     print(f"\nAssembly successful. Output: {output_file}")
     print(f"Binary size: {len(binary)} bytes")
-    
-    # Print listing
+
+    # Listing
     print("\nAssembly Listing:")
-    print("Line  Address  Bytes   Source")
-    for line_num, source_line, bytes_list in assembler.listing:
-        addr = assembler.symbol_table.get(source_line.split(':')[0].strip(), '')
+    print("Line  Address  Bytes                     Source")
+    for line_num, addr, src, bytes_list in assembler.listing:
+        addr_str = f"{addr:04X}"
         bytes_str = ' '.join(f'{b:02X}' for b in bytes_list) if bytes_list else ''
-        print(f"{line_num:<5} {addr:04X}     {bytes_str:<12} {source_line}")
+        print(f"{line_num:<5} {addr_str}    {bytes_str:<25} {src}")
 
 if __name__ == '__main__':
     main()
+
