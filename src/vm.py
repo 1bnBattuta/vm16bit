@@ -175,27 +175,22 @@ class VirtualMachine:
         self.write_mem(address + 1, (value >> 8) & 0xFF)
 
     def stack_push(self, value):
-        """Push 16-bit value onto stack with boundary check"""
-        sp = self.reg['SP']
-        
-        # Stack overflow protection
-        if sp - 2 < RAM_START:
+        """Push 16-bit value onto stack (stack grows downward)"""
+        sp = self.reg['SP'] - 2  # decrement first
+        if sp < RAM_START:
             raise MemoryError(f"Stack overflow at {hex(sp)}")
-        
         self.write_mem_word(sp, value)
-        self.reg['SP'] = sp - 2
+        self.reg['SP'] = sp
 
     def stack_pop(self):
-        """Pop 16-bit value from stack with boundary check"""
-        sp = self.reg['SP'] + 2
-        
-        # Stack underflow protection
-        if sp > RAM_END:
+        """Pop 16-bit value from stack"""
+        sp = self.reg['SP']
+        if sp + 2 > RAM_END:
             raise MemoryError(f"Stack underflow at {hex(sp)}")
-        
         value = self.read_mem_word(sp)
-        self.reg['SP'] = sp
+        self.reg['SP'] = sp + 2  # increment after reading
         return value
+
 
     def handle_io_write(self, port, value):
         """Handle I/O port writes"""
@@ -667,10 +662,12 @@ class VirtualMachine:
         print("Starting execution...")
         self.execute()
         print(f"\nExecution completed. Cycles: {self.cycles}")
+        return True #Indicate successful execution
 
     def add_breakpoint(self, address):
         """Add a breakpoint at specified address"""
         self.breakpoints.add(address)
+
 
 # =================================================================
 # COMMAND-LINE INTERFACE
