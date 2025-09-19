@@ -9,7 +9,6 @@ This is a personal project to build a 16-bit virtual CPU from scratch using Pyth
 - Learn about CPU architecture, instruction sets, memory models, and assembly language.
 - Build a custom assembly language and assembler.
 - Extend the system with a C compiler backend in the future.
-- Share knowledge and progress through GitHub and LinkedIn.
 
 ## How to Run
 
